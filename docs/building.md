@@ -6,9 +6,10 @@ carries the toolkit work this game needs (MSVC `__try/__except`,
 frame-pointer-omitted C++ frames, throws from a statically linked CRT,
 `VirtualQuery` on lifted images, the headless desktop).
 
-Linux and macOS: not yet. The host runs the lifted game inside a 32-bit
-Windows process against the real Windows DLLs (pcrecomp `native32`), and the
-Wine route has not been tried; `setup.sh` says so and stops.
+Linux and macOS: not yet playable. A native host on pcrecomp's `win32hle`
+(no Wine) is designed and scaffolded: `src/linux`, `cmake/native.cmake`,
+`build-linux.sh` and `build-macos.sh`. [linux-macos.md](linux-macos.md) has
+the design, the gaps, the build steps and the state. `setup.sh` still stops.
 
 ## Step by step
 

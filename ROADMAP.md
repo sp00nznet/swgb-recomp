@@ -95,18 +95,33 @@ what needs research or a new subsystem.
 
 ### 7. Linux and macOS
 - **Known:** pcrecomp's `win32hle` implements Win32 on libc, POSIX and
-  SDL2: DirectDraw, DirectSound, GDI with fonts, windows and messages, a
-  scaling SDL2 screen. Tiberian Sun and Red Alert 2 run on it natively on
-  Linux (Red Alert 2 on macOS too), with no Wine.
-- **Gaps:** EDIT controls (win32hle has none; the text fields and their
-  composition use `WM_PRINT`, `SetWindowRgn` and class styles); MCIWnd
-  (shared with 6, if the decoder lives in the host); `host.c`'s Win32
-  specifics (window subclassing, `GetGUIThreadInfo`, the private desktop
-  for headless runs); softdd against win32hle's DirectDraw (keep one); the
-  game's `WIN32.dll`, Steam's winmm wrapper that plays the CD music from
-  Ogg Vorbis (libvorbisfile); a 32-bit gcc or clang build of 4M lines.
-- **Risk:** large but plausible: the hard part exists; the gaps are
-  bounded.
+  SDL2: DirectDraw, DirectSound, GDI with fonts, windows and their controls,
+  a scaling SDL2 screen. Tiberian Sun, Red Alert 2 and Civilization III run
+  on it natively on Linux (Red Alert 2 on macOS too), with no Wine. The
+  whole lift passes gcc's front end as it is (54 files, 64-bit based, no
+  errors), and gcc `-O1` builds it in minutes. win32hle answers 237 of the
+  game's 258 imports; `src/linux/shims.c` answers the other 21.
+- **Design** ([docs/linux-macos.md](docs/linux-macos.md)): a second host,
+  `src/linux`, on win32hle. Its DirectDraw and `screen.c` replace softdd
+  there, and softdd stays the Windows one. Portable pieces are shared
+  (`inflate.c` through `guest.h`, the `--keys` grammar in `keyscript.c`).
+  `cmake/native.cmake` is the build, reached from `CMakeLists.txt` on Linux
+  and macOS.
+- **Done:** that scaffolding; the native host and shims, checked with gcc
+  against win32hle; no change on Windows.
+- **Work:** toolchain (`gcc-multilib`, i386 SDL2 and SDL2_ttf), then the
+  link and the bring-up loop to the main menu. 8-bit surface text in the
+  palette, and EDIT painting plus child-window walking (both pcrecomp
+  changes, in a pcrecomp worktree). Text-field composition through
+  `hle_dd_frame_hook`. MCI `cdaudio` over the Steam Ogg tracks, which also
+  gives Windows music and covers Clone Campaigns' `WIN32.dll` (which needs
+  no lift). Movies on Track 6's portable decoder core. Exceptions only if a
+  run raises. `setup.sh` and the harness on Linux. Then macOS (64-bit
+  based, needs a Mac).
+- **Estimate:** about 3 to 4 weeks to a playable Linux build; macOS one
+  more week.
+- **Risk:** medium. The hard part exists, and the rest is the bring-up loop
+  the sibling ports went through.
 
 ## Later
 - DirectPlay multiplayer over LAN.

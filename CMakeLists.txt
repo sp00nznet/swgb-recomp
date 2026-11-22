@@ -8,6 +8,12 @@
 cmake_minimum_required(VERSION 3.20)
 project(swgb C)
 
+# Linux and macOS: the win32hle host (src/linux), docs/linux-macos.md.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" OR APPLE)
+  include(cmake/native.cmake)
+  return()
+endif()
+
 if(NOT CMAKE_SIZEOF_VOID_P EQUAL 4)
   message(FATAL_ERROR "the host must be 32-bit: use build.cmd (vcvarsall x86)")
 endif()
