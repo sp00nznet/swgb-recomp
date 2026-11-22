@@ -22,18 +22,26 @@ what needs research or a new subsystem.
 - **Risk:** low.
 
 ### 2. Presentation: scaling, fullscreen, pacing
-- **Known:** windowed, the frame is `StretchDIBits`-ed to the whole client
-  area (85% of the screen height at 4:3, or `--scale N`), so a window
-  resized to another shape distorts it, and there is no smoothing choice
-  or fullscreen. A primary without a back buffer presents on every
-  `Unlock`/`ReleaseDC`: hundreds of presents a second in the menus.
-- **Work:** aspect-correct letterboxing; nearest, integer and smooth
-  scaling (pcrecomp's `win32hle/screen.c` has these modes for SDL2 to
-  borrow from); a borderless fullscreen toggle (Alt+Enter) that never
-  changes the desktop's mode; coalesce presents to the display's refresh.
-  Mouse mapping (`to_game`) and the text-field composition follow the
-  letterbox.
-- **Risk:** low. All of it is in `softdd.c` and `host.c`.
+- **Done (headless-verified; the windowed check is the user's):** a new
+  presenter (`src/runtime/present.c`) letterboxes the frame at its own
+  aspect in any window shape; filters `sharp` (default), `smooth`, `nearest`
+  and `integer` (`--filter`, Alt+F12); borderless fullscreen (`--fullscreen`,
+  Alt+Enter) on the window's monitor, never a display-mode change; presents
+  coalesced to the display's refresh, with the last frame always shown by a
+  timer; `--shot`, `--record`, `--frames` and the text-field composition
+  still get every frame they need. The mouse (`to_game`, and so
+  `click_child`) goes through the letterbox rectangle. Flags and hotkeys:
+  `docs/building.md`; tests: `docs/testing.md`, `tools/present_test.c`.
+  Measured: loading is 60,000+ presents a second, an idle menu 4 or 5; the
+  shown rate follows the refresh.
+- **Left:** the user's windowed and fullscreen check (look, Alt+Enter, a
+  resize, the filters); remember the window size, filter and fullscreen
+  between runs; confine the mouse to the window in fullscreen (a second
+  monitor lets it leave while scrolling the map); `softdd`'s
+  `GetMonitorFrequency` still says 60. The CPU scaler costs 3 ms (1080p) to
+  11 ms (4K) a frame for `sharp`/`smooth`: a GPU path (Direct3D 11) would
+  take it off the game thread.
+- **Risk:** low.
 
 ### 3. Widescreen and any resolution
 - **Known:** the game offers three 4:3 sizes and picks the mode from them;

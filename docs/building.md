@@ -63,8 +63,39 @@ build\swgbrecomp.exe --run --headless --record out.mp4        no window, record 
 build\swgbrecomp.exe --run --headless --shot 20 menu.bmp      save the frame after 20 s
 build\swgbrecomp.exe --run --keys "10:move:330:240,11:click:330:240"   scripted mouse and keys
 build\swgbrecomp.exe --run --headless --watchdog 60 --files   stop after 60 s, log every file opened
+build\swgbrecomp.exe --run --fullscreen --filter integer      borderless fullscreen, whole-number scaling
 py -3 tools\conformance.py                                    the milestones, PASS/FAIL
 ```
+
+### The picture: scaling, fullscreen, pacing
+
+The game draws a fixed frame (800x600, 1024x768, 1280x1024: always 4:3); the
+window can be any shape. The frame is fitted into the client area with its
+aspect kept and black bars, and the mouse is mapped through that same
+rectangle (a click in a bar lands on the nearest edge of the picture).
+
+| Flag | Hotkey | What |
+|---|---|---|
+| `--filter sharp\|smooth\|nearest\|integer` | `Alt+F12` cycles | `sharp` (default): nearest inside a texel, a one-pixel blend at its edges, so no shimmer and no blur at fractional scales. `smooth`: bilinear. `nearest`: nearest neighbour at any size (uneven pixels at odd scales). `integer`: nearest, whole multiples only (bars around, falls back to a fit when the window is smaller than the frame). The window title shows the filter. |
+| `--fullscreen` | `Alt+Enter` toggles | A borderless window the size of the monitor the window is on. The desktop's display mode is never changed, so Alt+Tab and other monitors behave as for any window. |
+| `--scale N` | | The window starts at N times the game's mode (default: 85% of the screen height). Resize it freely after that. |
+| `--refresh HZ` | | Pace frames to HZ instead of the monitor's refresh rate. |
+| `--present-log` | | Once a second on stderr: presents, frames shown, the refresh rate and filter. |
+
+The game presents far more often than a display refreshes (every
+`Unlock`/`ReleaseDC` of a primary without a back buffer: tens of thousands a
+second while loading, a handful in an idle menu). A frame is drawn when a
+refresh interval has passed since the last one; otherwise it is held, and a
+one-shot timer draws the latest after the interval, so the last frame before
+the game goes quiet is never lost. `--shot`, `--record` (30 fps by the wall
+clock) and `--frames` still see every frame they need, and the game's text
+fields are composed into the frame that is drawn.
+
+For scripted tests (`--keys`, see testing.md), all headless: `size:W:H`
+resizes the window's client area, `wshot=FILE` writes the window as it would
+be drawn (bars and all, any filter), `wmove:X:Y` and `wclick:X:Y` take window
+pixels and map them like the mouse does, and `alt+enter` and `alt+f12` press
+the hotkeys.
 
 `--args "..."` passes switches to the game itself; `--game`, `--cd` and
 `--exe` point at other folders. `NATIVE32_TRACE_EH=1` logs every guest
@@ -80,6 +111,6 @@ generated C unoptimized, much faster; the default is `/O1`. On a
 lands the build in `build-farm\`.
 
 Layout: `run_lift.py` (lift driver), `src/runtime/` (host, `softdd`
-DirectDraw, the deflate decoder), `tools/` (setup, the update unpacker, the
+DirectDraw, `present` for scaling, fullscreen and pacing, the deflate decoder), `tools/` (setup, the update unpacker, the
 conformance harness), `third_party/miniz` (MIT, see `NOTICE`), and the
 gitignored `game/`, `cd/`, `work/` and `src/recomp/gen/`.

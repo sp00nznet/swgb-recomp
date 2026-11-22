@@ -49,6 +49,7 @@ endif()
 add_executable(swgb
   src/runtime/host.c
   src/runtime/softdd.c
+  src/runtime/present.c
   src/runtime/inflate.c
   third_party/miniz/miniz.c
   ${PCRECOMP}/runtime/native32/native32.c
@@ -71,7 +72,7 @@ set(GEN_OPT "/O1" CACHE STRING "optimization for the generated C")
 if(GEN_SOURCES)
   set_source_files_properties(${GEN_SOURCES} PROPERTIES COMPILE_OPTIONS "/w;${GEN_OPT}")
 endif()
-set_source_files_properties(src/runtime/host.c src/runtime/softdd.c src/runtime/inflate.c PROPERTIES COMPILE_OPTIONS "/W3")
+set_source_files_properties(src/runtime/host.c src/runtime/softdd.c src/runtime/present.c src/runtime/inflate.c PROPERTIES COMPILE_OPTIONS "/W3")
 set_source_files_properties(third_party/miniz/miniz.c PROPERTIES COMPILE_OPTIONS "/w;/O2")
 target_link_libraries(swgb PRIVATE user32 gdi32 kernel32 ole32 uuid dxguid winmm ws2_32 shlwapi advapi32)
 

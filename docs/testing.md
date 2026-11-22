@@ -50,3 +50,26 @@ is `seconds:action`: `move:X:Y`, `click:X:Y`, a key name, or `shot=FILE.bmp`.
 `--watchdog` ends the run and says where the game was; `--files` logs every
 file opened; `NATIVE32_TRACE_EH=1` logs every guest exception and where it
 lands.
+
+## The picture (scaling, fullscreen, pacing)
+
+Headless too. The presenter's layout and mouse mapping, without the game:
+
+```
+cl /nologo tools\present_test.c srcuntime\present.c /Isrcuntime user32.lib gdi32.lib
+present_test.exe                                  OK
+```
+
+With the game: resize the window, look at it, and click through the letterbox:
+
+```
+build\swgbrecomp.exe --run --headless --multi --watchdog 40 --present-log ^
+  --keys "9:size:1200:700,10:wshot=win.bmp,11:wclick:180:661"
+```
+
+`win.bmp` is the 800x600 frame centred in 1200x700 (picture 133,0 933x700),
+and `wclick:180:661` is the Exit button's place in that window, so the run
+ends with code 0 (a click elsewhere leaves the game up and the watchdog ends
+it with 4). `--present-log` prints presents against frames shown each second:
+a loading phase of 60,000 presents a second shows as the display's refresh or
+less, and an idle menu as 4 or 5.

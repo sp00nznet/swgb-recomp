@@ -32,6 +32,7 @@
 #include "recomp_trace.h"
 #include "softdd.h"
 #include "softdd_int.h"
+#include "present.h"
 
 extern const uint32_t swgb_entry_va;  /* recomp_dispatch.c */
 
@@ -230,13 +231,15 @@ static void shim_MCIWndCreateA(void) {
 static WNDPROC g_game_proc;
 static int g_scripted;   /* --keys (below) */
 
+/* A client pixel -> a game pixel, through the picture's letterboxed rectangle
+ * (present.c): the same one the frame is drawn into. */
 static void to_game(POINT* p) {
     DD* d = softdd_dd();
-    RECT rc;
-    if (!d || !d->w || !g_game_wnd || !GetClientRect(g_game_wnd, &rc) || !rc.right || !rc.bottom) return;
-    p->x = p->x * d->w / rc.right;
-    p->y = p->y * d->h / rc.bottom;
+    if (!d || !d->w || !g_game_wnd) return;
+    present_to_game(g_game_wnd, d->w, d->h, p);
 }
+
+#define WM_SWGB_SIZE (WM_APP + 0x51)   /* --keys size:W:H, run on the window's own thread */
 
 /* Text fields are real EDIT children that softdd draws into the frame and
  * that never take part in hit-testing themselves (an empty window region),
@@ -269,6 +272,8 @@ static int click_child(UINT m, WPARAM w, int x, int y) {
 static HWND g_focus_child;
 
 static LRESULT CALLBACK host_wndproc(HWND h, UINT m, WPARAM w, LPARAM l) {
+    /* resized, uncovered or a new display mode: the picture is laid out and shown again */
+    if (m == WM_SIZE || m == WM_PAINT || m == WM_DISPLAYCHANGE) present_invalidate(h);
     switch (m) {
     case WM_ACTIVATEAPP: case WM_NCACTIVATE: w = TRUE; break;
     case WM_ACTIVATE: {
@@ -288,7 +293,16 @@ static LRESULT CALLBACK host_wndproc(HWND h, UINT m, WPARAM w, LPARAM l) {
     case WM_NCCALCSIZE: case WM_STYLECHANGED: case WM_STYLECHANGING: case WM_SIZE:
         return DefWindowProcA(h, m, w, l);
     case WM_ERASEBKGND: return 1;
-    case WM_TIMER: if (w == SOFTDD_TIMER) { softdd_tick(); return 0; } break;
+    case WM_TIMER: if (w == SOFTDD_TIMER || w == SOFTDD_PACE) { softdd_tick(); return 0; } break;
+    /* Alt+Enter: borderless fullscreen; Alt+F12: the next scaling filter. */
+    case WM_SYSKEYDOWN:
+        if (w == VK_RETURN || w == VK_F12) {
+            if (!(l & (1 << 30))) { if (w == VK_RETURN) present_set_fullscreen(h, -1); else present_cycle_filter(h); }
+            return 0;
+        }
+        break;
+    case WM_SYSKEYUP: case WM_SYSCHAR: if (w == VK_RETURN || w == VK_F12) return 0; break;
+    case WM_SWGB_SIZE: present_set_client_size(h, (int)w, (int)l); return 0;
     }
     if (m >= WM_MOUSEFIRST && m <= WM_MOUSELAST && m != WM_MOUSEWHEEL) {
         POINT p = { GET_X_LPARAM(l), GET_Y_LPARAM(l) };
@@ -354,7 +368,7 @@ static void shim_DirectDrawCreate(void) {
  * left, right, tab, f1..f10, a letter or digit), "click:X:Y" or "move:X:Y"
  * (game pixels), "shot=FILE", or "on:NAME" (wait for a file open). While a
  * script runs, the real mouse is not read: only the script reaches the game. */
-typedef struct { DWORD at; int vk, x, y, click, move; char on[64], shot[MAX_PATH]; } step_t;
+typedef struct { DWORD at; int vk, x, y, click, move, alt, win, size, wshot; char on[64], shot[MAX_PATH]; } step_t;
 
 static step_t g_steps[128];
 static int g_nsteps;
@@ -366,6 +380,7 @@ static const struct { const char* n; int vk; } g_keynames[] = {
     { "up", VK_UP }, { "down", VK_DOWN }, { "left", VK_LEFT }, { "right", VK_RIGHT },
     { "bksp", VK_BACK }, { "f1", VK_F1 }, { "f2", VK_F2 }, { "f3", VK_F3 }, { "f4", VK_F4 },
     { "f5", VK_F5 }, { "f6", VK_F6 }, { "f7", VK_F7 }, { "f8", VK_F8 }, { "f9", VK_F9 }, { "f10", VK_F10 },
+    { "f11", VK_F11 }, { "f12", VK_F12 },
 };
 
 static int key_by_name(const char* n) {
@@ -388,12 +403,25 @@ static void parse_keys(const char* spec) {
         }
         st.at = (DWORD)(atof(tok) * 1000);
         char* what = c + 1;
-        if (!strncmp(what, "shot=", 5)) {
+        if (!strncmp(what, "wshot=", 6)) {   /* the window as drawn: letterbox bars and all */
+            GetFullPathNameA(what + 6, MAX_PATH, st.shot, NULL);
+            st.wshot = 1;
+        } else if (!strncmp(what, "shot=", 5)) {
             GetFullPathNameA(what + 5, MAX_PATH, st.shot, NULL);
+        } else if (!strncmp(what, "size:", 5)) {   /* the window's client area: W:H */
+            st.size = 1;
+            sscanf(what + 5, "%d:%d", &st.x, &st.y);
+        } else if (!strncmp(what, "wclick:", 7) || !strncmp(what, "wmove:", 6)) {   /* window pixels, mapped like the mouse */
+            st.win = 1;
+            st.click = what[1] == 'c';
+            st.move = 1;
+            sscanf(strchr(what, ':') + 1, "%d:%d", &st.x, &st.y);
         } else if (!strncmp(what, "click:", 6) || !strncmp(what, "move:", 5)) {
             st.click = what[0] == 'c';
             st.move = 1;
             sscanf(strchr(what, ':') + 1, "%d:%d", &st.x, &st.y);
+        } else if (!strncmp(what, "alt+", 4) && (st.vk = key_by_name(what + 4))) {
+            st.alt = 1;   /* Alt+Enter, Alt+F12: the presenter's hotkeys */
         } else if (!(st.vk = key_by_name(what))) {
             fprintf(stderr, "--keys: unknown key \"%s\"\n", what);
             exit(1);
@@ -422,8 +450,20 @@ static DWORD WINAPI keys_thread(LPVOID unused) {
             }
         DWORD at = t0 + st->at, now = GetTickCount();
         if ((int)(at - now) > 0) Sleep(at - now);
-        if (st->shot[0]) { softdd_shot(st->shot); continue; }
+        if (st->shot[0]) { if (st->wshot) present_wshot_request(st->shot); else softdd_shot(st->shot); continue; }
         HWND w = g_game_wnd;
+        if (st->size) {
+            if (w) PostMessageA(w, WM_SWGB_SIZE, (WPARAM)st->x, (LPARAM)st->y);
+            printf("[keys] %.1fs size %dx%d\n", st->at / 1000.0, st->x, st->y);
+            continue;
+        }
+        if (st->win) {   /* window pixels -> game pixels, as the mouse is mapped */
+            POINT p = { st->x, st->y };
+            DD* d = softdd_dd();
+            if (d && d->w && w) present_to_game(w, d->w, d->h, &p);
+            printf("[keys] window %d,%d -> game %ld,%ld\n", st->x, st->y, p.x, p.y);
+            st->x = p.x, st->y = p.y;
+        }
         if (st->move) {
             g_cur_x = st->x, g_cur_y = st->y;
             if (w) PostMessageA(w, WM_MOUSEMOVE, 0, MAKELPARAM(st->x, st->y));
@@ -437,6 +477,13 @@ static DWORD WINAPI keys_thread(LPVOID unused) {
             printf("[keys] %.1fs %s %d,%d\n", st->at / 1000.0, st->click ? "click" : "move", st->x, st->y);
         } else {
             UINT sc = MapVirtualKeyA(st->vk, 0);
+            if (st->alt) {   /* Alt+key: a system key, to the window itself */
+                if (w) PostMessageA(w, WM_SYSKEYDOWN, st->vk, 1 | (sc << 16) | (1 << 29));
+                Sleep(150);
+                if (w) PostMessageA(w, WM_SYSKEYUP, st->vk, 1 | (sc << 16) | (1 << 29) | 0xC0000000u);
+                printf("[keys] %.1fs alt+key %02X\n", st->at / 1000.0, st->vk);
+                continue;
+            }
             {   /* keys go where the game's focus is: a text field is a real edit control */
                 GUITHREADINFO gi = { sizeof gi };
                 if (w && GetGUIThreadInfo(GetWindowThreadProcessId(w, NULL), &gi) && gi.hwndFocus) w = gi.hwndFocus;
@@ -672,6 +719,12 @@ int main(int argc, char** argv) {
         }
         else if (!strcmp(argv[i], "--frames") && i + 1 < argc) softdd_stop_after = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--scale") && i + 1 < argc) softdd_scale = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--filter") && i + 1 < argc) {
+            if ((present_filter = present_filter_by_name(argv[++i])) < 0) { fprintf(stderr, "--filter: sharp, smooth, nearest or integer\n"); return 1; }
+        }
+        else if (!strcmp(argv[i], "--fullscreen")) present_fullscreen_start = 1;
+        else if (!strcmp(argv[i], "--refresh") && i + 1 < argc) present_refresh = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--present-log")) present_log = 1;
         else if (!strcmp(argv[i], "--files")) g_log_files = 1;
         else if (!strcmp(argv[i], "--multi")) g_multi = 1;
         else if (!strcmp(argv[i], "--shot") && i + 2 < argc && g_shots < 16) {
@@ -689,6 +742,8 @@ int main(int argc, char** argv) {
         else {
             printf("usage: swgbrecomp [--run] [--headless] [--record out.mp4] [--frames N] [--sound]\n"
                    "                  [--shot S file.bmp] [--keys SCRIPT] [--watchdog S] [--files] [--multi]\n"
+                   "                  [--scale N] [--filter sharp|smooth|nearest|integer] [--fullscreen]\n"
+                   "                  [--refresh HZ] [--present-log]\n"
                    "                  [--exe work\\Battlegrounds.exe] [--game game] [--cd E]\n"
                    "                  [--args \"<game switches>\"] [--callbacks] [--native-trace]\n");
             recomp_trace_help();

@@ -33,6 +33,7 @@
 
 #include "softdd.h"
 #include "softdd_int.h"
+#include "present.h"
 
 int         softdd_headless;
 int         softdd_scale = 0;   /* --scale N; 0: fit the screen */
@@ -335,35 +336,58 @@ static Surf* compose(Surf* s) {
     return &g_comp;
 }
 
-static void present(Surf* s);
+static void present_impl(Surf* s, int from_game);
 
-/* From the game window's timer: while a text field is up, show typing and
- * the caret even when the game itself draws nothing new. */
+/* From the game window's timers (the 100 ms one and the pacing one): show a
+ * frame that was held back, or, while a text field is up, typing and the
+ * caret even when the game itself draws nothing new. */
 void softdd_tick(void) {
-    if (!g_dd || !g_dd->primary || GetTickCount() - g_last_present < 90 || !has_children()) return;
-    present(g_dd->primary);
+    if (!g_dd || !g_dd->primary) return;
+    present_disarm(g_dd->hwnd);
+    if (present_dirty()) { present_impl(g_dd->primary, 0); return; }
+    if (GetTickCount() - g_last_present < 90 || !has_children()) return;
+    present_impl(g_dd->primary, 0);
 }
 
-static void present(Surf* s) {
-    g_last_present = GetTickCount();
+static void present(Surf* s) { present_impl(s, 1); }
+
+/* A recording frame is due (30 fps by the wall clock, or the first one). */
+static int record_due(void) {
+    return !g_rec || (LONG)((GetTickCount() - g_rec_t0) * (DWORD)REC_FPS / 1000) + 1 > g_rec_written;
+}
+
+/* The game presents far more often than a display refreshes: a frame is
+ * shown (composed, drawn) when a refresh interval has passed (present.c),
+ * and otherwise held back, and shown by a timer if nothing newer comes. A
+ * --shot, a recording tick or the last --frames frame is never held back. */
+static void present_impl(Surf* s, int from_game) {
+    LONG n = softdd_frames;
+    if (from_game) {
+        g_last_present = GetTickCount();
+        n = InterlockedIncrement(&softdd_frames);
+        if (n == 1 || n == 10 || n == 100 || n % 1000 == 0)
+            fprintf(stderr, "[softdd] frame %ld presented\n", n);
+    }
+    HWND win = g_dd ? g_dd->hwnd : NULL;
+    int paint = present_due(win);
+    present_note(from_game, paint);
+    if (!paint && !softdd_on_present && !g_shot_due && !present_wshot_pending() &&
+        !(softdd_stop_after && n >= softdd_stop_after) && !(softdd_record && record_due())) {
+        present_defer(win);
+        return;
+    }
     s = compose(s);
-    LONG n = InterlockedIncrement(&softdd_frames);
-    if (n == 1 || n == 10 || n == 100 || n % 1000 == 0)
-        fprintf(stderr, "[softdd] frame %ld presented\n", n);
     if (softdd_on_present) softdd_on_present(s->bits, s->w, s->h, s->pitch, n);
     if (g_shot_due) { write_shot(s); InterlockedExchange(&g_shot_due, 0); }
+    if (present_wshot_pending()) present_wshot_write(win, s->bits, s->w, s->h, s->pitch, s->bpp, screen_palette());
     if (softdd_record && (s->bpp == 16 || s->bpp == 8)) {
         if (!g_rec) record_open(s->w, s->h);
         record_frame(s);
     }
-    if (!softdd_headless && g_dd && g_dd->hwnd) {
-        RECT rc;
-        HDC dc = GetDC(g_dd->hwnd);
-        GetClientRect(g_dd->hwnd, &rc);
-        StretchDIBits(dc, 0, 0, rc.right, rc.bottom, 0, 0, s->w, s->h, s->bits,
-                      bmi_of(s), DIB_RGB_COLORS, SRCCOPY);
-        ReleaseDC(g_dd->hwnd, dc);
-    }
+    if (paint) {
+        if (!softdd_headless && win) present_paint(win, s->bits, s->w, s->h, s->pitch, s->bpp, screen_palette());
+        present_painted();
+    } else present_defer(win);
     if (softdd_stop_after && n >= softdd_stop_after) {
         fprintf(stderr, "[softdd] %ld frames: stopping (--frames)\n", n);
         softdd_finish();
@@ -397,6 +421,7 @@ static void fit_window(DD* d) {
     AdjustWindowRect(&r, style, FALSE);
     SetWindowPos(d->hwnd, HWND_NOTOPMOST, 64, 64, r.right - r.left, r.bottom - r.top,
                  SWP_FRAMECHANGED | SWP_SHOWWINDOW);
+    if (present_fullscreen_start) present_set_fullscreen(d->hwnd, 1);   /* --fullscreen */
 }
 
 /* ------------------------------------------------------------- blits */
