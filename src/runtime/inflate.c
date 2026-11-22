@@ -24,7 +24,7 @@
 #include <stdio.h>
 #include <string.h>
 
-#include "native32.h"
+#include "guest.h"   /* native32 on Windows, win32hle on Linux and macOS */
 #include "miniz.h"
 
 #define STATE_RESUME 0xA958u
@@ -57,9 +57,9 @@ void swgb_inflate(void) {
     mz_stream* z = stream_for(a[6]);
     int r = -2;
     if (z) {
-        z->next_in = (const unsigned char*)(uintptr_t)in;
+        z->next_in = (const unsigned char*)GUEST_PTR(in);
         z->avail_in = in_len;
-        z->next_out = (unsigned char*)(uintptr_t)out;
+        z->next_out = (unsigned char*)GUEST_PTR(out);
         z->avail_out = out_len;
         int s = mz_inflate(z, MZ_NO_FLUSH);
         MEM32(a[2]) = in_len - z->avail_in;
