@@ -32,6 +32,8 @@
 #include "recomp_trace.h"
 #include "softdd.h"
 #include "softdd_int.h"
+#include "hires.h"
+#include "dplay32.h"
 
 extern const uint32_t swgb_entry_va;  /* recomp_dispatch.c */
 
@@ -251,6 +253,10 @@ static void shim_CreateWindowExA(void) {
         g_game_proc = (WNDPROC)SetWindowLongPtrA(h, GWLP_WNDPROC, (LONG_PTR)host_wndproc);
         g_game_wnd = h;
         PostMessageA(h, WM_ACTIVATEAPP, TRUE, 0);
+        /* and active: the game keeps its own flag from WM_ACTIVATE
+         * (sub_00429330), and while it is clear its main loop waits in
+         * GetMessage; a window on a private desktop is never activated */
+        PostMessageA(h, WM_ACTIVATE, WA_ACTIVE, 0);
     }
     SetLastError(err);
     g_eax = (uint32_t)(uintptr_t)h;
@@ -284,10 +290,11 @@ static void shim_DirectDrawCreate(void) {
 
 /* ---- scripted input (--keys) ---------------------------------------------------
  * "SECONDS:what,..." where what is a key name (esc, enter, space, up, down,
- * left, right, tab, f1..f10, a letter or digit), "click:X:Y" or "move:X:Y"
- * (game pixels), "shot=FILE", or "on:NAME" (wait for a file open). While a
- * script runs, the real mouse is not read: only the script reaches the game. */
-typedef struct { DWORD at; int vk, x, y, click, move; char on[64], shot[MAX_PATH]; } step_t;
+ * left, right, tab, f1..f12, a letter or digit), "hold:KEY:SECONDS",
+ * "click:X:Y", "rclick:X:Y" or "move:X:Y" (game pixels), "shot=FILE", or
+ * "on:NAME" (wait for a file open). While a script runs, the real mouse is
+ * not read: only the script reaches the game. */
+typedef struct { DWORD at; int vk, x, y, click, move, hold; char on[64], shot[MAX_PATH]; } step_t;
 
 static step_t g_steps[128];
 static int g_nsteps;
@@ -298,7 +305,7 @@ static const struct { const char* n; int vk; } g_keynames[] = {
     { "esc", VK_ESCAPE }, { "enter", VK_RETURN }, { "space", VK_SPACE }, { "tab", VK_TAB },
     { "up", VK_UP }, { "down", VK_DOWN }, { "left", VK_LEFT }, { "right", VK_RIGHT },
     { "bksp", VK_BACK }, { "f1", VK_F1 }, { "f2", VK_F2 }, { "f3", VK_F3 }, { "f4", VK_F4 },
-    { "f5", VK_F5 }, { "f6", VK_F6 }, { "f7", VK_F7 }, { "f8", VK_F8 }, { "f9", VK_F9 }, { "f10", VK_F10 },
+    { "f5", VK_F5 }, { "f6", VK_F6 }, { "f7", VK_F7 }, { "f8", VK_F8 }, { "f9", VK_F9 }, { "f10", VK_F10 }, { "f11", VK_F11 }, { "f12", VK_F12 },
 };
 
 static int key_by_name(const char* n) {
@@ -324,10 +331,16 @@ static void parse_keys(const char* spec) {
         char* what = c + 1;
         if (!strncmp(what, "shot=", 5)) {
             GetFullPathNameA(what + 5, MAX_PATH, st.shot, NULL);
-        } else if (!strncmp(what, "click:", 6) || !strncmp(what, "move:", 5)) {
-            st.click = what[0] == 'c';
+        } else if (!strncmp(what, "click:", 6) || !strncmp(what, "rclick:", 7) || !strncmp(what, "move:", 5)) {
+            st.click = what[0] == 'c' ? 1 : what[0] == 'r' ? 2 : 0;
             st.move = 1;
             sscanf(strchr(what, ':') + 1, "%d:%d", &st.x, &st.y);
+        } else if (!strncmp(what, "hold:", 5)) {   /* hold:KEY:SECONDS */
+            char k[16] = "";
+            double secs = 1;
+            sscanf(what + 5, "%15[^:]:%lf", k, &secs);
+            st.hold = (int)(secs * 1000);
+            if (!(st.vk = key_by_name(k))) { fprintf(stderr, "--keys: unknown key \"%s\"\n", k); exit(1); }
         } else if (!(st.vk = key_by_name(what))) {
             fprintf(stderr, "--keys: unknown key \"%s\"\n", what);
             exit(1);
@@ -362,23 +375,25 @@ static DWORD WINAPI keys_thread(LPVOID unused) {
             g_cur_x = st->x, g_cur_y = st->y;
             if (w) PostMessageA(w, WM_MOUSEMOVE, 0, MAKELPARAM(st->x, st->y));
             if (st->click) {
+                int r = st->click == 2;
                 Sleep(100);
-                g_vk_until[VK_LBUTTON] = GetTickCount() + 150;
-                if (w) PostMessageA(w, WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(st->x, st->y));
+                g_vk_until[r ? VK_RBUTTON : VK_LBUTTON] = GetTickCount() + 150;
+                if (w) PostMessageA(w, r ? WM_RBUTTONDOWN : WM_LBUTTONDOWN, r ? MK_RBUTTON : MK_LBUTTON, MAKELPARAM(st->x, st->y));
                 Sleep(150);
-                if (w) PostMessageA(w, WM_LBUTTONUP, 0, MAKELPARAM(st->x, st->y));
+                if (w) PostMessageA(w, r ? WM_RBUTTONUP : WM_LBUTTONUP, 0, MAKELPARAM(st->x, st->y));
             }
-            printf("[keys] %.1fs %s %d,%d\n", st->at / 1000.0, st->click ? "click" : "move", st->x, st->y);
+            printf("[keys] %.1fs %s %d,%d\n", st->at / 1000.0, st->click == 2 ? "rclick" : st->click ? "click" : "move", st->x, st->y);
         } else {
             UINT sc = MapVirtualKeyA(st->vk, 0);
             {   /* keys go where the game's focus is: a text field is a real edit control */
                 GUITHREADINFO gi = { sizeof gi };
                 if (w && GetGUIThreadInfo(GetWindowThreadProcessId(w, NULL), &gi) && gi.hwndFocus) w = gi.hwndFocus;
             }
-            g_vk_until[st->vk & 0xFF] = GetTickCount() + 150;
+            int len = st->hold ? st->hold : 150;
+            g_vk_until[st->vk & 0xFF] = GetTickCount() + len;
+            /* the game's message loop translates it: its character comes once */
             if (w) PostMessageA(w, WM_KEYDOWN, st->vk, 1 | (sc << 16));
-            if (w && st->vk >= '0' && st->vk <= 'Z') PostMessageA(w, WM_CHAR, tolower(st->vk), 1 | (sc << 16));
-            Sleep(150);
+            Sleep(len);
             if (w) PostMessageA(w, WM_KEYUP, st->vk, 1 | (sc << 16) | 0xC0000000u);
             printf("[keys] %.1fs key %02X\n", st->at / 1000.0, st->vk);
         }
@@ -401,6 +416,17 @@ static void shim_GetKeyState(void) {
     SHORT r = g_scripted ? 0 : GetKeyState(vk);
     if (held(vk)) r |= (SHORT)0x8000;
     g_eax = (uint16_t)r;
+    g_esp += 4 + 1 * 4;
+}
+
+/* The battle screen scrolls on the arrow keys from here (sub_005F9760). */
+static void shim_GetKeyboardState(void) {
+    BYTE* k = (BYTE*)(uintptr_t)ARG(0);
+    BOOL r = TRUE;
+    if (g_scripted) memset(k, 0, 256);
+    else r = GetKeyboardState(k);
+    for (int vk = 0; vk < 256; vk++) if (held(vk)) k[vk] |= 0x80;
+    g_eax = (uint32_t)r;
     g_esp += 4 + 1 * 4;
 }
 
@@ -450,7 +476,53 @@ static void shim_LoadCursorA(void) {
     g_esp += 4 + 2 * 4;
 }
 
+/* ---- DirectPlay: pcrecomp's own (dplay32.c), not Windows' --------------------
+ * Windows' DirectPlay is an optional feature that no longer finds sessions
+ * between machines; the game gets a TCP one that does. */
+static void shim_DirectPlayCreate(void) {       /* (guid, &dp, outer) */
+    g_eax = (uint32_t)dplay32_create((void**)(uintptr_t)ARG(1));
+    g_esp += 4 + 3 * 4;
+}
+static void shim_DirectPlayEnumerateA(void) {   /* (callback, context): the callback is the game's */
+    uint32_t esp = g_esp;
+    HRESULT hr = dplay32_enumerate((void*)(uintptr_t)ARG(0), (void*)(uintptr_t)ARG(1));
+    g_esp = esp;
+    g_eax = (uint32_t)hr;
+    g_esp += 4 + 2 * 4;
+}
+static void shim_DirectPlayLobbyCreateA(void) { /* (sp, &lobby, outer, data, size) */
+    g_eax = (uint32_t)dplay32_lobby_create((void**)(uintptr_t)ARG(1));
+    g_esp += 4 + 5 * 4;
+}
+static void shim_CoCreateInstance(void) {       /* (clsid, outer, context, iid, &obj) */
+    const GUID* clsid = (const GUID*)(uintptr_t)ARG(0);
+    const GUID* iid = (const GUID*)(uintptr_t)ARG(3);
+    void** out = (void**)(uintptr_t)ARG(4);
+    HRESULT hr;
+    if (dplay32_is_clsid(clsid))
+        hr = clsid->Data1 == 0xd1eb6d20u ? dplay32_create_iid(iid, out) : dplay32_lobby_create(out);
+    else {
+        IUnknown* outer = (IUnknown*)(uintptr_t)ARG(1);
+        DWORD ctx = ARG(2);
+        UNLOCKED(hr = CoCreateInstance(clsid, outer, ctx, iid, out));
+    }
+    g_eax = (uint32_t)hr;
+    g_esp += 4 + 5 * 4;
+}
+
+/* sub_00477DA0, the game's check for DirectPlay 6.1a/7 or Windows 2000's:
+ * it asks the dplayx.dll loaded in the process for its file version. The
+ * DirectPlay here is dplay32, and there may be no dplayx.dll at all. */
+void swgb_dplay_ok(void) {
+    g_eax = 1;
+    g_esp += 4;
+}
+
 static native32_shim_t g_shims[] = {
+    { "DPLAYX.dll#1", shim_DirectPlayCreate },
+    { "DPLAYX.dll#2", shim_DirectPlayEnumerateA },
+    { "DPLAYX.dll#4", shim_DirectPlayLobbyCreateA },
+    { "CoCreateInstance", shim_CoCreateInstance },
     { "LoadIconA", shim_LoadIconA },
     { "LoadCursorA", shim_LoadCursorA },
     { "GetCursorPos", shim_GetCursorPos },
@@ -459,6 +531,7 @@ static native32_shim_t g_shims[] = {
     { "ClientToScreen", shim_ClientToScreen },
     { "GetAsyncKeyState", shim_GetAsyncKeyState },
     { "GetKeyState", shim_GetKeyState },
+    { "GetKeyboardState", shim_GetKeyboardState },
     { "DirectDrawCreate", shim_DirectDrawCreate },
     { "GetForegroundWindow", shim_GetForegroundWindow },
     { "GetActiveWindow", shim_GetActiveWindow },
@@ -560,12 +633,48 @@ static LONG CALLBACK crash(EXCEPTION_POINTERS* ep) {
     return EXCEPTION_CONTINUE_SEARCH;
 }
 
+/* --profile: which lifted function was entered last, sampled every
+ * millisecond; the top 30 when the run ends (the watchdog, or exit). */
+static volatile LONG g_prof_on;
+static struct { uint32_t va, n; } g_prof[1 << 14];
+static DWORD WINAPI profiler(LPVOID unused) {
+    (void)unused;
+    timeBeginPeriod(1);
+    while (g_prof_on) {
+        uint32_t va = g_cur_func, h = (va * 2654435761u) >> 18;
+        for (int k = 0; k < 64; k++, h = (h + 1) & ((1 << 14) - 1))
+            if (g_prof[h].va == va || !g_prof[h].va) { g_prof[h].va = va; g_prof[h].n++; break; }
+        Sleep(1);
+    }
+    return 0;
+}
+static void profile_dump(void) {
+    uint32_t total = 0;
+    if (!InterlockedExchange(&g_prof_on, 0)) return;
+    for (int i = 0; i < (1 << 14); i++) total += g_prof[i].n;
+    fprintf(stderr, "[profile] %u samples, the most entered:\n", total);
+    for (int k = 0; k < 30 && total; k++) {
+        int best = -1;
+        for (int i = 0; i < (1 << 14); i++) if (g_prof[i].n && (best < 0 || g_prof[i].n > g_prof[best].n)) best = i;
+        if (best < 0) break;
+        fprintf(stderr, "  sub_%08X %5.1f%%\n", g_prof[best].va, 100.0 * g_prof[best].n / total);
+        g_prof[best].n = 0;
+    }
+}
+
 static DWORD WINAPI watchdog(LPVOID unused) {
     (void)unused;
     Sleep(g_watchdog_s * 1000);
     fprintf(stderr, "\n[watchdog] %lu s: in sub_%08X, last native call %s, %u indirect calls, %ld frames\n",
             g_watchdog_s, g_cur_func, g_cur_import, g_icall_count, softdd_frames);
     native32_dump_icalls(8);
+    profile_dump();
+    {   /* the game object (0x006A0FD4): its active flag, its mode (2 the menus,
+         * 4 a game) and its comm handler's state (4: paused for a player) */
+        uint32_t g = MEM32(0x006A0FD4u), c = g ? MEM32(g + 0x1B4) : 0;
+        if (g) fprintf(stderr, "[state] active %u, mode %u, comm state %u\n",
+                       MEM32(g + 0x30), MEM32(g + 0x1DC), c ? MEM32(c + 0x1E3C) : 0);
+    }
     recomp_trace_flush();
     softdd_finish();
     fflush(stdout);
@@ -574,12 +683,45 @@ static DWORD WINAPI watchdog(LPVOID unused) {
     return 0;
 }
 
+/* ---- settings: swgbrecomp.ini beside the program, then the command line -------
+ *   [swgb]
+ *   resolution=1920x1080   the game's size; "screen": the screen's; "game": its own (Options)
+ *   lan_host=192.168.1.20  where else to look for LAN games (dplay32)
+ * --classic is the original game: 800x600, nothing of the remaster's size. */
+static char g_ini[MAX_PATH];
+
+static int parse_res(const char* s, int* w, int* h) {
+    int a = 0, b = 0;
+    if (!s || !*s || !_stricmp(s, "game")) { *w = *h = 0; return 1; }
+    if (!_stricmp(s, "screen")) a = GetSystemMetrics(SM_CXSCREEN), b = GetSystemMetrics(SM_CYSCREEN);   /* the primary screen's */
+    else if (sscanf(s, "%dx%d", &a, &b) != 2) return 0;
+    if (!swgb_res_valid(a, b)) return 0;
+    *w = a, *h = b;
+    return 1;
+}
+
+static void settings_load(const char* res_arg, int classic) {
+    char v[64], *slash;
+    GetModuleFileNameA(NULL, g_ini, MAX_PATH);
+    if ((slash = strrchr(g_ini, '\\'))) strcpy(slash + 1, "swgbrecomp.ini");
+    GetPrivateProfileStringA("swgb", "resolution", "game", v, sizeof v, g_ini);
+    if (!parse_res(res_arg ? res_arg : v, &swgb_res_w, &swgb_res_h)) {
+        fprintf(stderr, "resolution \"%s\": 800x600, 1024x720 to 4096x4096, screen or game\n", res_arg ? res_arg : v);
+        swgb_res_w = swgb_res_h = 0;
+    }
+    if (GetPrivateProfileStringA("swgb", "lan_host", "", v, sizeof v, g_ini) && !GetEnvironmentVariableA("PCRECOMP_DPLAY_HOST", NULL, 0))
+        SetEnvironmentVariableA("PCRECOMP_DPLAY_HOST", v);
+    if (classic) swgb_res_w = 800, swgb_res_h = 600;
+    if (swgb_res_w) printf("  resolution: %dx%d%s\n", swgb_res_w, swgb_res_h, classic ? " (--classic)" : "");
+}
+
 int main(int argc, char** argv) {
     const char* exe = "work\\Battlegrounds.exe";
     const char* game = "game";
     const char* cd = NULL;
     char exe_full[MAX_PATH], game_full[MAX_PATH], guest_args[512] = "";
-    int run = 0, sound = 0;
+    int run = 0, sound = 0, classic = 0;
+    const char* res_arg = NULL;
     setvbuf(stdout, NULL, _IONBF, 0);   /* a fault ends the run with TerminateProcess */
     /* --headless runs again on a private desktop (native32_headless): there the
      * window can be visible, so it gets WM_PAINT, which the game's dialogs
@@ -588,7 +730,11 @@ int main(int argc, char** argv) {
         if (!strcmp(argv[i], "--headless")) {
             int rc;
             if (!GetEnvironmentVariableA("PCRECOMP_MUTE", NULL, 0)) SetEnvironmentVariableA("PCRECOMP_MUTE", "1");
-            if ((rc = native32_headless()) >= 0) return rc;
+            /* the game ran in the child: its exit code, a crash's negative */
+            if ((rc = native32_headless()) != -1) {
+                if (rc < 0) fprintf(stderr, "[headless] the game ended with 0x%08X\n", (unsigned)rc);
+                return rc;
+            }
             g_hide = !GetEnvironmentVariableA("NATIVE32_HEADLESS", NULL, 0);
         }
     for (int i = 1; i < argc; i++) {
@@ -605,6 +751,10 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--frames") && i + 1 < argc) softdd_stop_after = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--scale") && i + 1 < argc) softdd_scale = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--files")) g_log_files = 1;
+        else if (!strcmp(argv[i], "--profile")) g_prof_on = 1;
+        else if (!strcmp(argv[i], "--res") && i + 1 < argc) res_arg = argv[++i];
+        else if (!strcmp(argv[i], "--classic")) classic = 1;
+        else if (!strcmp(argv[i], "--lan-host") && i + 1 < argc) SetEnvironmentVariableA("PCRECOMP_DPLAY_HOST", argv[++i]);
         else if (!strcmp(argv[i], "--shot") && i + 2 < argc && g_shots < 16) {
             g_shot_s[g_shots] = strtoul(argv[++i], NULL, 0);
             GetFullPathNameA(argv[++i], MAX_PATH, g_shot_file[g_shots++], NULL);
@@ -618,14 +768,16 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--callbacks")) native32_trace_callbacks = 1;
         else if (!strcmp(argv[i], "--native-trace")) native32_trace_native = 1;
         else {
-            printf("usage: swgbrecomp [--run] [--headless] [--record out.mp4] [--frames N] [--sound]\n"
-                   "                  [--shot S file.bmp] [--keys SCRIPT] [--watchdog S] [--files]\n"
+            printf("usage: swgbrecomp [--run] [--res WxH|screen|game] [--classic] [--lan-host ADDR]\n"
+                   "                  [--headless] [--record out.mp4] [--frames N] [--sound]\n"
+                   "                  [--shot S file.bmp] [--keys SCRIPT] [--watchdog S] [--files] [--profile]\n"
                    "                  [--exe work\\Battlegrounds.exe] [--game game] [--cd E]\n"
                    "                  [--args \"<game switches>\"] [--callbacks] [--native-trace]\n");
             recomp_trace_help();
             return argv[i][1] == 'h' || argv[i][2] == 'h' ? 0 : 1;
         }
     }
+    settings_load(res_arg, classic);
     GetFullPathNameA(exe, MAX_PATH, exe_full, NULL);
     GetFullPathNameA(game, MAX_PATH, game_full, NULL);
     cd_pick(cd);
@@ -659,6 +811,7 @@ int main(int argc, char** argv) {
     }
     printf("  audio: %s\n", sound ? "on" : m == 2 ? "muted (no audio device)" : "muted (a test run; --sound to hear it)");
     if (g_watchdog_s) CloseHandle(CreateThread(NULL, 0, watchdog, NULL, 0, NULL));
+    if (g_prof_on) CloseHandle(CreateThread(NULL, 0, profiler, NULL, 0, NULL));
     if (g_shots) CloseHandle(CreateThread(NULL, 0, shot_thread, NULL, 0, NULL));
     g_file_seen = CreateEventA(NULL, FALSE, FALSE, NULL);
     if (g_nsteps) CloseHandle(CreateThread(NULL, 0, keys_thread, NULL, 0, NULL));

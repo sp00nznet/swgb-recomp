@@ -4,7 +4,8 @@
 already done, and logs everything to `setup.log`. It clones pcrecomp main if it is not beside this folder; main
 carries the toolkit work this game needs (MSVC `__try/__except`,
 frame-pointer-omitted C++ frames, throws from a statically linked CRT,
-`VirtualQuery` on lifted images, the headless desktop).
+`VirtualQuery` on lifted images, the headless desktop, the DirectPlay over
+TCP).
 
 Linux and macOS: not yet. The host runs the lifted game inside a 32-bit
 Windows process against the real Windows DLLs (pcrecomp `native32`), and the
@@ -43,7 +44,7 @@ with C++" (CMake and Ninja come with it); ffmpeg on `PATH` for `--record`.
    ```
    py -3 run_lift.py --all
    ```
-   Expected: `lifted 14273   not-lifted stubs 0   errors 0` and about 4.0M
+   Expected: `lifted 14299   not-lifted stubs 0   errors 0` and about 4.0M
    lines of C in `src\recomp\gen\`.
 6. Build it (30 minutes or more on one machine): `build.cmd`. Expected, at
    the end: `Linking C executable swgbrecomp.exe`.
@@ -52,12 +53,16 @@ with C++" (CMake and Ninja come with it); ffmpeg on `PATH` for `--record`.
 8. Run: `build\swgbrecomp.exe --run`.
 
 Trip-ups: a different build of `Battlegrounds.exe` is refused by `run_lift.py`
-by its PE timestamp; a pcrecomp checkout on `main` lacks the EH support
-(`AttributeError: module 'eh32' has no attribute 'frame'`).
+by its PE timestamp; an older pcrecomp checkout lacks the EH support
+(`AttributeError: module 'eh32' has no attribute 'frame'`) or the DirectPlay
+(`runtime/native32/dplay32.c` not found): pull it.
 
 ## The command line
 
 ```
+build\swgbrecomp.exe --run --res 1920x1080                    the game at 1920x1080 (docs/hires.md)
+build\swgbrecomp.exe --run --classic                          the original game: 800x600
+build\swgbrecomp.exe --run --lan-host 192.168.1.20            look for LAN games there too (docs/multiplayer.md)
 build\swgbrecomp.exe --run                                    windowed, with sound
 build\swgbrecomp.exe --run --headless --record out.mp4        no window, record the frames
 build\swgbrecomp.exe --run --headless --shot 20 menu.bmp      save the frame after 20 s
@@ -68,18 +73,28 @@ py -3 tools\conformance.py                                    the milestones, PA
 
 `--args "..."` passes switches to the game itself; `--game`, `--cd` and
 `--exe` point at other folders. `NATIVE32_TRACE_EH=1` logs every guest
-exception and where it lands.
+exception and where it lands. `SWGB_FPS=N` holds the game to N frames a
+second (60; 0 for as fast as it can, where its clock runs fast).
+
+`swgbrecomp.ini`, beside the program, keeps settings between runs; the
+command line wins over it:
+
+```ini
+[swgb]
+resolution=1920x1080      ; or screen (the screen's size), or game (Options, Screen Size)
+lan_host=192.168.1.20     ; where else to look for LAN games
+```
 
 ## Build options
 
 `build.cmd` configures CMake with Ninja for 32-bit MSVC and builds
 `build\swgbrecomp.exe`. `-DGEN_OPT=/Od` (in `CMAKE_ARGS`) compiles the
 generated C unoptimized, much faster; the default is `/O1`. On a
-[recomp-netlab](https://github.com/sp00nznet/recomp-netlab) farm:
+[netlab](https://github.com/sp00nznet/netlab) farm:
 `netlab build swgb-recomp` (recipe `projects/swgb-recomp.env`, `/Od`), which
 lands the build in `build-farm\`.
 
 Layout: `run_lift.py` (lift driver), `src/runtime/` (host, `softdd`
-DirectDraw, the deflate decoder), `tools/` (setup, the update unpacker, the
+DirectDraw, `hires` sizes, the deflate decoder), `tools/` (setup, the update unpacker, the
 conformance harness), `third_party/miniz` (MIT, see `NOTICE`), and the
 gitignored `game/`, `cd/`, `work/` and `src/recomp/gen/`.

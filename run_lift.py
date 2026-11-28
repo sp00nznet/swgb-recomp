@@ -98,22 +98,84 @@ DATA_IN_CODE = []
 def is_data(va):
     return any(lo <= va < hi for lo, hi in DATA_IN_CODE)
 
-# Fixes to the game itself: C run after the instruction at the address.
-PATCHES = {}
+# C run after the instruction at the address. The lift stays faithful: a
+# patch is a line of C for something the original only got away with on real
+# DirectDraw, or the remaster's, calling the host (src/runtime/hires.c).
+PATCHES = {
+    # The mouse pointer's "center" (sub_0049F5C0) reads the draw area the
+    # pointer is suspended from across a mode change (sub_0049E540 clears it;
+    # the next main-loop tick, sub_00428F80, puts it back). Starting a game at
+    # 1024x768 or 1280x1024 changes the mode and centers at once: a null read.
+    # Real DirectDraw's SetDisplayMode let Windows' messages resume it first.
+    0x0049F5C0: 'if (!eax) { RECOMP_FLAGS_OUT(); esp += 4; RECOMP_REGS_OUT(); return; } '
+                '/* fix: pointer suspended, run_lift.py */',
+    # ---- high resolution and widescreen (hires.c, docs/hires.md) ----
+    # The size the game enters (sub_0042C0C0; w, h in eax, esi): the
+    # remaster's when one is set.
+    0x0042C0D3: 'swgb_game_res(&eax, &esi); /* remaster: resolution, hires.c */',
+    # TPanel's two rect setters, after their first read: the in-game screen's
+    # panels moved from the class layout to the real size. set_rect(x1, y1,
+    # x2, y2) (edx = y2) calls the class's set_rect(x, y, w, h) (eax = x),
+    # which is also called straight; hires.c says why both.
+    0x004B5780: 'swgb_rect(ecx, esp); edx = MEM32(esp + 0x10); /* remaster: widescreen layout, hires.c */',
+    0x004B579E: 'swgb_rect_done(); /* remaster: widescreen layout, hires.c */',
+    0x004B5660: 'swgb_rect_xywh(ecx, esp); eax = MEM32(esp + 4); /* remaster: widescreen layout, hires.c */',
+    # The DRS read (fastcall type, id, &allocated, &size; ret 8), on entry:
+    # the bottom panel's picture, widened.
+    0x004D4B30: 'if (swgb_fetch(ecx, edx, MEM32(esp + 0xC), MEM32(esp + 0x10), &eax)) { RECOMP_FLAGS_OUT(); '
+                'esp += 8 + 4 + 8; RECOMP_REGS_OUT(); return; } /* remaster: widescreen panel, hires.c */',
+    # The screen's draw (sub_004FEDB0) puts one picture by hand, at
+    # 684,982 (1280x1024) or 521,733 (1024x768): moved like the panels.
+    0x004FEF67: 'swgb_xy(esp, esp + 4); /* remaster: widescreen layout, hires.c */',
+    0x004FEF8F: 'swgb_xy(esp, esp + 4); /* remaster: widescreen layout, hires.c */',
+}
+
+# Size compares that pick a layout (hires.c swgb_cls): the remaster's width
+# or height reads as its class's (1280x1024 or 1024x768), so the game lays
+# out and draws for that class; everything else sees the real size.
+# 'w': a width, 'h': a height. The patch goes after the cmp's flag lines.
+CLASS_SITES = {
+    0x004F5314: 'w', 0x004F531B: 'w',                      # the screen's layout column (screen_coords.txt)
+    0x004FC67E: 'w', 0x004FC685: 'h', 0x004FC6AC: 'w',     # its panel picture (51101-51146; 1600x1200 has none)
+    0x004FC6B3: 'h', 0x004FC6F4: 'w', 0x004FC6FB: 'h',
+    0x004FEF27: 'w', 0x004FEF54: 'w', 0x004FEF7C: 'w',     # its draw
+    0x005013C1: 'w', 0x005013D4: 'w',                      # its sub-panels' places
+    0x005D4988: 'w', 0x005D499E: 'w',                      # the resources' and unit display's size index
+    0x005D5192: 'w', 0x005D51A5: 'w', 0x005D5D39: 'w', 0x005D5D48: 'w',
+    0x004B7916: 'w', 0x004B78F1: 'w',                      # text: the fonts for the size
+    0x00469E84: 'w', 0x00469E8C: 'w', 0x00469E94: 'w',     # the map view's draw
+    0x00462D58: 'h', 0x00462EF2: 'h', 0x00462FCA: 'h',     # the map view's setup
+    0x00463446: 'h', 0x00463454: 'h', 0x0046346E: 'h',
+}
+AFTER_BLOCK = {va: '_flag_a = swgb_cls(0x%08Xu, _flag_a, %d); _cf = (uint32_t)CMP_B(_flag_a, _flag_b); '
+                   '/* remaster: size class, hires.c */' % (va, k == 'h') for va, k in CLASS_SITES.items()}
 
 # Functions the host does instead (src/runtime/*.c says why for each).
 HLE = {
     0x0062343B: 'swgb_inflate',   # the deflate decoder, a stack-copying coroutine (inflate.c)
+    0x00477DA0: 'swgb_dplay_ok',  # the DirectPlay version check: dplay32 is there (host.c)
 }
-PATCH_DECLS = ''.join('void %s(void);\n' % f for f in HLE.values())
+# The host functions the patches call (hires.c).
+HOOK_DECLS = [
+    'void swgb_game_res(uint32_t* w, uint32_t* h)',
+    'void swgb_rect(uint32_t self, uint32_t esp)',
+    'void swgb_rect_done(void)',
+    'void swgb_rect_xywh(uint32_t self, uint32_t esp)',
+    'int swgb_fetch(uint32_t type, uint32_t id, uint32_t allocated, uint32_t size, uint32_t* data)',
+    'void swgb_xy(uint32_t px, uint32_t py)',
+    'uint32_t swgb_cls(uint32_t site, uint32_t v, int is_h)',
+]
+PATCH_DECLS = ''.join('void %s(void);\n' % f for f in HLE.values()) + ''.join(d + ';\n' for d in HOOK_DECLS)
 
 
-def apply_patches(body, patches):
+def apply_patches(body, patches, after_block=False):
     """Add each patch's C after the lines that lift its instruction.
 
     Some instructions lift to a block over several lines (idiv's `{ ... }`):
     the patch goes after the block closes, not inside it. From the Tiberium
-    Wars driver (tiberiumwars-recomp run_lift.py)."""
+    Wars driver (tiberiumwars-recomp run_lift.py). after_block: after every
+    line the instruction lifts to, up to the next instruction or label (a
+    cmp's comment comes first and its flag lines after it)."""
     for va, c in patches.items():
         tag = '/* 0x%08X:' % va
         k = body.find(tag)
@@ -124,6 +186,12 @@ def apply_patches(body, patches):
             while depth > 0:
                 s, e = e + 1, body.index('\n', e + 1)
                 depth += body[s:e].count('{') - body[s:e].count('}')
+            while after_block:
+                n = body.index('\n', e + 1)
+                line = body[e + 1:n]
+                if '/* 0x' in line or line.startswith('L_') or line.strip() == '}':
+                    break
+                e = n
             body = body[:e + 1] + '    ' + c + '\n' + body[e + 1:]
     return body
 
@@ -267,6 +335,8 @@ def lift_module(path, catalog, args, out, extra_roots):
                 raise ValueError('no instructions at 0x%08X' % addr)
             body = lift_function_linear(lifter, name, insns, leaders, addr, eh_resume=resume, eh_off=off)
             body = apply_patches(body, {va: c for va, c in PATCHES.items() if reached and va in reached})
+            body = apply_patches(body, {va: c for va, c in AFTER_BLOCK.items() if reached and va in reached},
+                                 after_block=True)
         except Exception as e:                      # noqa: BLE001 -- counted, not hidden
             body = '/* ERROR %s: %s */\nvoid %s(void) { }\n' % (name, e, name)
             errors += 1
@@ -356,10 +426,10 @@ def main():
     # A patch that found no instruction to follow is a fix that silently isn't there.
     gen = ''.join(open(os.path.join(args.out, fn), encoding='utf-8', errors='replace').read()
                   for fn in os.listdir(args.out) if fn.endswith('.c'))
-    for va, c in PATCHES.items():
+    for va, c in list(PATCHES.items()) + list(AFTER_BLOCK.items()):
         if c not in gen:
             sys.exit('patch at 0x%08X (%s) was not applied: is 0x%08X lifted?' % (va, c, va))
-    print('[*] patches applied: %d' % len(PATCHES))
+    print('[*] patches applied: %d' % (len(PATCHES) + len(AFTER_BLOCK)))
 
     lines = sum(sum(1 for _ in open(os.path.join(args.out, fn), encoding='utf-8', errors='replace'))
                 for fn in os.listdir(args.out))

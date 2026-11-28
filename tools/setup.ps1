@@ -113,12 +113,13 @@ if (-not (Test-Path (Join-Path $Toolkit 'tools\lift\lift32.py'))) {
   Run "Cloning pcrecomp" @('git', 'clone', '--depth', '1', 'https://github.com/sp00nznet/pcrecomp', $Toolkit)
 }
 # What this game needs from the toolkit, each by a line it adds: MSVC
-# exception frames, the extent walk's seeds (run_lift.py uses both) and the
-# headless desktop, all in pcrecomp main.
+# exception frames, the extent walk's seeds (run_lift.py uses both), the
+# headless desktop and the DirectPlay for LAN games, all in pcrecomp main.
 $need = @(
   @('MSVC exception frames (eh32.frame)', 'tools\lift\eh32.py', 'def frame('),
   @('the extent walk with seeds (generate.py)', 'tools\lift\generate.py', 'seeds=()'),
-  @('the headless desktop', 'runtime\native32\native32.c', 'native32_headless'))
+  @('the headless desktop', 'runtime\native32\native32.c', 'native32_headless'),
+  @('the DirectPlay (dplay32)', 'runtime\native32\dplay32.c', 'dplay32_create_iid'))
 function Missing { @($need | Where-Object {
   $f = Join-Path $Toolkit $_[1]
   -not ((Test-Path $f) -and (Select-String -Path $f -Pattern $_[2] -SimpleMatch -Quiet)) } | ForEach-Object { $_[0] }) }

@@ -5,6 +5,49 @@ versions follow [SemVer](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- High resolution and widescreen (`docs/hires.md`): any size from 1024x720
+  to 4096x4096 (`--res WxH`, `--res screen`, or `resolution=` in
+  `swgbrecomp.ini`), more of the map on screen. The game lays out and draws
+  for the nearest of its own sizes (its size compares see that size:
+  `run_lift.py` CLASS_SITES); the host moves its in-game panels to the real
+  size as they are placed, leaves its dialogs centred, and widens the bottom
+  panel's picture (`src/runtime/hires.c`).
+- LAN multiplayer (`docs/multiplayer.md`): the game's DirectPlay is
+  pcrecomp's `dplay32` (sp00nznet/pcrecomp#208) in place of Windows', which
+  no longer finds games between machines; games are found by a LAN broadcast,
+  or at `--lan-host` (`lan_host=`). The game's version check of `dplayx.dll`
+  is answered by the host (sub_00477DA0).
+- `--classic`: the original game, 800x600.
+- `swgbrecomp.ini` beside the program (`[swgb] resolution=`, `lan_host=`).
+- `--keys`: `rclick:X:Y`, `hold:KEY:SECONDS`, `f11`/`f12`; `--profile`, a
+  sampling profile of the lifted code; the watchdog prints the game's state.
+
+### Fixed
+- The game ran a fifth fast. Drawing as fast as it could, about a thousand
+  frames a second, its clock gained: 1.81 game seconds a second at Normal,
+  where the game means 1.5. The software DirectDraw now holds it to 60 frames
+  a second, as a display's refresh did (`SWGB_FPS`), and the clock keeps
+  1.5.
+- The game's own 1024x768 and 1280x1024: starting a game at either crashed
+  (the mouse pointer centred while suspended across the mode change).
+- The arrow keys scroll the map in a scripted run (`GetKeyboardState`).
+- A scripted key typed its letter twice ("ab" came out "aabb").
+- `--record` with `--watchdog`: the end of the run closed the video under
+  the game's write of a frame, and the process died (0xC0000409) before its
+  log was flushed.
+- `--headless`: a game that died that way was started again by the process
+  that launched it, on the visible desktop; its exit code is reported now.
+
+### Changed
+- The window takes the shape of the game's size when it changes (the 4:3
+  menus, then a widescreen battle), keeping its height.
+- `--record` records at the remaster's size, the 800x600 menus scaled into
+  it; it took the first frame's size, and a game at another size came out
+  garbled.
+- `docs/testing.md`: test runs go in a logged-on session (a scheduled task);
+  started straight from SSH the battle draws one frame and stops.
+
 ## [0.1.0] - 2026-11-20
 
 - Builds against pcrecomp main; the `pcrecomp-ingame` branch is merged.

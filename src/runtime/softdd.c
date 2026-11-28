@@ -6,6 +6,8 @@
  * (X-Wing's 640x480x8, Galactic Battlegrounds' 800x600x8 and up): a surface is 8 or 16 bits by the display mode when it
  * was made, an 8-bit one is coloured through the primary's palette when
  * presented, and a palette change presents (the game fades by palette).
+ * Galactic Battlegrounds never flips: it draws into its back buffer and sets
+ * its palette each frame, and those palette changes are its presents.
  *
  * The engine asks for exclusive fullscreen 640x480x16 with a flip chain
  * (SetCooperativeLevel 0x51, SetDisplayMode 640/480/16). Real DirectDraw
@@ -26,6 +28,7 @@
 #define WIN32_LEAN_AND_MEAN
 #define CINTERFACE
 #include <windows.h>
+#include <mmsystem.h>
 #include <ddraw.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -33,6 +36,7 @@
 
 #include "softdd.h"
 #include "softdd_int.h"
+#include "hires.h"
 
 int         softdd_headless;
 int         softdd_scale = 0;   /* --scale N; 0: fit the screen */
@@ -173,10 +177,21 @@ static void surf_free(Surf* s) {
 static FILE* g_rec;
 static DWORD g_rec_t0;
 static LONG  g_rec_written;
+static int   g_rec_w, g_rec_h;   /* the video's size */
+static int   g_rec_done;
+/* The game's thread writes the frames and the watchdog's (or a fault's)
+ * closes the video: closed under a frame's write, the CRT ended the process
+ * (0xC0000409) before the mp4 or the log were flushed. */
+static CRITICAL_SECTION g_rec_lock;
 #define REC_FPS 30
 
+/* The video is the remaster's size when one is set (the 800x600 menus are
+ * scaled into it), else the first frame's. */
 static void record_open(int w, int h) {
     char cmd[1024];
+    InitializeCriticalSection(&g_rec_lock);
+    if (swgb_res_w) w = swgb_res_w, h = swgb_res_h;
+    g_rec_w = w, g_rec_h = h;
     _snprintf(cmd, sizeof cmd - 1,
               "ffmpeg -loglevel error -y -f rawvideo -pix_fmt rgb565le -s %dx%d -r %d -i - "
               "-c:v libx264 -preset veryfast -pix_fmt yuv420p \"%s\"", w, h, REC_FPS, softdd_record);
@@ -187,28 +202,50 @@ static void record_open(int w, int h) {
 }
 
 void softdd_finish(void) {
+    if (!g_rec) return;
+    EnterCriticalSection(&g_rec_lock);
     if (g_rec) { _pclose(g_rec); g_rec = NULL; }
+    g_rec_done = 1;
+    LeaveCriticalSection(&g_rec_lock);
 }
 
 /* The video runs at a fixed 30 fps against the wall clock: a slow frame is
- * held, a fast one is dropped, so the mp4 plays at the game's real speed. */
+ * held, a fast one is dropped, so the mp4 plays at the game's real speed. A
+ * frame of another size than the video's is scaled to fit, keeping its
+ * shape, with black around it. */
 static void record_frame(Surf* s) {
     LONG due = (LONG)((GetTickCount() - g_rec_t0) * (DWORD)REC_FPS / 1000) + 1;
-    static uint16_t* row;
-    static int row_w;
-    if (s->bpp == 8 && row_w < s->w) { free(row); row = (uint16_t*)malloc(2 * s->w); row_w = s->w; }
-    PALETTEENTRY* e = screen_palette();
-    for (; g_rec_written < due; g_rec_written++)
-        for (int y = 0; y < s->h; y++) {
-            if (s->bpp == 16) { fwrite(s->bits + y * s->pitch, 2, s->w, g_rec); continue; }
-            const uint8_t* src = s->bits + y * s->pitch;   /* 8-bit: through the palette */
-            for (int x = 0; x < s->w; x++) {
-                PALETTEENTRY c = e ? e[src[x]] : (PALETTEENTRY){ src[x], src[x], src[x], 0 };
-                row[x] = (uint16_t)(((c.peRed >> 3) << 11) | ((c.peGreen >> 2) << 5) | (c.peBlue >> 3));
-            }
-            fwrite(row, 2, s->w, g_rec);
-        }
-    fflush(g_rec);
+    static uint16_t* frame;
+    static int* xmap;
+    uint16_t lut[256];
+    if (g_rec_written >= due) return;
+    if (!frame) {
+        frame = (uint16_t*)malloc((size_t)g_rec_w * g_rec_h * 2);
+        xmap = (int*)malloc(sizeof(int) * g_rec_w);
+        if (!frame || !xmap) { fprintf(stderr, "[softdd] out of memory for the recording\n"); exit(5); }
+    }
+    PALETTEENTRY* e = screen_palette();   /* 8-bit: through the palette */
+    for (int i = 0; i < 256; i++) {
+        PALETTEENTRY c = e ? e[i] : (PALETTEENTRY){ (BYTE)i, (BYTE)i, (BYTE)i, 0 };
+        lut[i] = (uint16_t)(((c.peRed >> 3) << 11) | ((c.peGreen >> 2) << 5) | (c.peBlue >> 3));
+    }
+    int fw = g_rec_w, fh = (int)((int64_t)g_rec_w * s->h / s->w);
+    if (fh > g_rec_h) fh = g_rec_h, fw = (int)((int64_t)g_rec_h * s->w / s->h);
+    int ox = (g_rec_w - fw) / 2, oy = (g_rec_h - fh) / 2;
+    for (int x = 0; x < fw; x++) xmap[x] = (int)((int64_t)x * s->w / fw);
+    if (fw != g_rec_w || fh != g_rec_h) memset(frame, 0, (size_t)g_rec_w * g_rec_h * 2);
+    for (int y = 0; y < fh; y++) {
+        const uint8_t* src = s->bits + (size_t)((int64_t)y * s->h / fh) * s->pitch;
+        uint16_t* d = frame + (size_t)(oy + y) * g_rec_w + ox;
+        if (s->bpp == 16) for (int x = 0; x < fw; x++) d[x] = ((const uint16_t*)src)[xmap[x]];
+        else for (int x = 0; x < fw; x++) d[x] = lut[src[xmap[x]]];
+    }
+    EnterCriticalSection(&g_rec_lock);
+    if (g_rec) {
+        for (; g_rec_written < due; g_rec_written++) fwrite(frame, 2, (size_t)g_rec_w * g_rec_h, g_rec);
+        fflush(g_rec);
+    }
+    LeaveCriticalSection(&g_rec_lock);
 }
 
 /* --shot: the front buffer as it is presented, never the screen. */
@@ -231,13 +268,35 @@ static void write_shot(Surf* s) {
     fprintf(stderr, "[shot] frame %ld %dx%dx%d -> %s\n", softdd_frames, s->w, s->h, s->bpp, g_shot_path);
 }
 
+/* The game draws as fast as it can, and its world clock gains at that pace:
+ * at a thousand frames a second a game at Normal ran a fifth fast. A real
+ * display held it to its refresh; this one does too, at 60 Hz (SWGB_FPS sets
+ * another rate, 0 none). */
+static void pace(void) {
+    static LARGE_INTEGER f, next;
+    static int hz = -1;
+    LARGE_INTEGER t;
+    if (hz < 0) {
+        char v[16];
+        hz = GetEnvironmentVariableA("SWGB_FPS", v, sizeof v) ? atoi(v) : 60;
+        QueryPerformanceFrequency(&f);
+        timeBeginPeriod(1);
+    }
+    if (hz <= 0) return;
+    QueryPerformanceCounter(&t);
+    LONGLONG ahead = next.QuadPart - t.QuadPart;
+    if (ahead > 0) Sleep((DWORD)(ahead * 1000 / f.QuadPart));
+    next.QuadPart = (ahead > 0 ? next.QuadPart : t.QuadPart) + f.QuadPart / hz;
+}
+
 static void present(Surf* s) {
+    pace();
     LONG n = InterlockedIncrement(&softdd_frames);
     if (n == 1 || n == 10 || n == 100 || n % 1000 == 0)
         fprintf(stderr, "[softdd] frame %ld presented\n", n);
     if (softdd_on_present) softdd_on_present(s->bits, s->w, s->h, s->pitch, n);
     if (g_shot_due) { write_shot(s); InterlockedExchange(&g_shot_due, 0); }
-    if (softdd_record && (s->bpp == 16 || s->bpp == 8)) {
+    if (softdd_record && !g_rec_done && (s->bpp == 16 || s->bpp == 8)) {
         if (!g_rec) record_open(s->w, s->h);
         record_frame(s);
     }
@@ -268,10 +327,24 @@ static void maybe_present(Surf* s) {
  * times --scale. */
 static void fit_window(DD* d) {
     static int placed;
-    if (softdd_headless || !d->hwnd || !d->w || placed) return;
-    placed = 1;   /* once: after that the window is the player's to size */
-    RECT wa;
+    RECT wa, rc;
+    if (softdd_headless || !d->hwnd || !d->w) return;
     SystemParametersInfoA(SPI_GETWORKAREA, 0, &wa, 0);
+    if (placed) {
+        /* After that the window is the player's to size; a mode of another
+         * shape (a widescreen battle after the 4:3 menus) keeps its height
+         * and takes the mode's shape, within the screen. */
+        if (!GetClientRect(d->hwnd, &rc) || rc.bottom <= 0 || IsZoomed(d->hwnd)) return;
+        int ch = rc.bottom, cw = ch * d->w / d->h, room = (wa.right - wa.left) * 95 / 100;
+        if (cw > room) cw = room, ch = cw * d->h / d->w;
+        if (abs(cw - rc.right) <= 1 && ch == rc.bottom) return;
+        RECT r = { 0, 0, cw, ch };
+        AdjustWindowRect(&r, (DWORD)GetWindowLongA(d->hwnd, GWL_STYLE), FALSE);
+        SetWindowPos(d->hwnd, NULL, 0, 0, r.right - r.left, r.bottom - r.top, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+        fprintf(stderr, "[softdd] the window takes the mode's shape: %dx%d\n", cw, ch);
+        return;
+    }
+    placed = 1;
     /* --scale N: N times the mode; otherwise 85% of the screen height, at 4:3 */
     int ch = softdd_scale > 0 ? d->h * softdd_scale : (wa.bottom - wa.top) * 85 / 100;
     if (ch < d->h) ch = d->h;
@@ -747,11 +820,12 @@ static HRESULT WINAPI d_EnumDisplayModes(IDirectDraw* This, DWORD f, LPDDSURFACE
                                          LPDDENUMMODESCALLBACK cb) {
     /* Every mode at 8 and 16 bits: Galactic Battlegrounds looks for its
      * 8-bit 800x600 .. 1280x1024 here and calls DirectDraw unusable without. */
-    static const int modes[][2] = { {640, 480}, {800, 600}, {1024, 768}, {1280, 1024} };
+    int modes[][2] = { {640, 480}, {800, 600}, {1024, 768}, {1280, 1024}, {swgb_res_w, swgb_res_h} };
     static const int depths[] = { 8, 16 };
+    int n = swgb_res_w ? 5 : 4;   /* and the remaster's own size (hires.c) */
     (void)This; (void)f; (void)want;
     for (int k = 0; k < 2; k++)
-        for (int i = 0; i < 4; i++) {
+        for (int i = 0; i < n; i++) {
             DDSURFACEDESC d;
             memset(&d, 0, sizeof d);
             d.dwSize = sizeof d;
